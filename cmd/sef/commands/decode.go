@@ -9,6 +9,7 @@ import (
 	"github.com/lucasdbr05/sef-golang/decoder"
 	"github.com/lucasdbr05/sef-golang/droplet"
 	"github.com/lucasdbr05/sef-golang/encode"
+	"github.com/lucasdbr05/sef-golang/superblock"
 	"github.com/spf13/cobra"
 )
 
@@ -17,6 +18,7 @@ func DecodeCmd() *cobra.Command {
 	var blocksDir string
 	var outDir string
 	var network string
+	var superblockSize int
 
 	cmd := &cobra.Command{
 		Use:   "decode",
@@ -41,7 +43,24 @@ func DecodeCmd() *cobra.Command {
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Found %d epoch(s)\n", len(epochOrder))
 
-			// Load trusted headers if blocks-dir provided
+			var epochSuperManifests map[uint64]superblock.Manifest
+			manifestPath := dropletsFile + ".superblock.bin"
+			if superblockSize > 0 || fileExists(manifestPath) {
+				data, err := os.ReadFile(manifestPath)
+				if err != nil {
+					return fmt.Errorf("reading superblock manifest %s: %w", manifestPath, err)
+				}
+				epochs, err := superblock.DeserializeManifests(data)
+				if err != nil {
+					return fmt.Errorf("deserializing superblock manifest: %w", err)
+				}
+				epochSuperManifests = make(map[uint64]superblock.Manifest, len(epochs))
+				for _, em := range epochs {
+					epochSuperManifests[em.EpochID] = em.Manifest
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Loaded superblock manifests for %d epoch(s)\n", len(epochSuperManifests))
+			}
+
 			var headers []wire.BlockHeader
 			if blocksDir != "" {
 				magic, err := parseNetwork(network)
@@ -78,39 +97,72 @@ func DecodeCmd() *cobra.Command {
 			for _, eid := range epochOrder {
 				drops := epochMap[eid]
 
-				// Infer k from the maximum block index seen across this epoch's droplets.
-				// With enough droplets (≥ 2K) all indices should be covered, making this exact.
-				var maxIdx uint32
-				for _, d := range drops {
-					for _, idx := range d.Indices {
-						if idx > maxIdx {
-							maxIdx = idx
+				sbManifest, hasSuperblocks := epochSuperManifests[eid]
+
+				var k int
+				if hasSuperblocks {
+					k = sbManifest.TotalSupers
+				} else {
+					var maxIdx uint32
+					for _, d := range drops {
+						for _, idx := range d.Indices {
+							if idx > maxIdx {
+								maxIdx = idx
+							}
 						}
 					}
+					k = int(maxIdx) + 1
 				}
-				k := int(maxIdx) + 1
 
-				// Slice headers for this epoch
 				var verifier decoder.BlockVerifier = decoder.AcceptAllVerifier{}
 				if len(headers) > 0 {
-					start := globalBlockOffset
-					end := start + k
-					if end > len(headers) {
-						end = len(headers)
+					if hasSuperblocks {
+						start := globalBlockOffset
+						end := start + sbManifest.TotalBlocks
+						if end > len(headers) {
+							end = len(headers)
+						}
+						epochHeaders := headers[start:end]
+						verifier = decoder.NewSuperblockBitcoinVerifier(epochHeaders, sbManifest.BlockCounts)
+					} else {
+						start := globalBlockOffset
+						end := start + k
+						if end > len(headers) {
+							end = len(headers)
+						}
+						epochHeaders := headers[start:end]
+						verifier = decoder.NewBitcoinBlockVerifier(epochHeaders)
 					}
-					epochHeaders := headers[start:end]
-					verifier = decoder.NewBitcoinBlockVerifier(epochHeaders)
 				}
 
 				result := decoder.PeelingDecode(k, drops, verifier)
-				fmt.Fprintf(cmd.OutOrStdout(), "  Epoch %d: decoded %d/%d (stop: %s, verify_failures: %d)\n",
-					eid, result.DecodedCount, result.K, result.StopReason, result.VerifyFailures)
 
-				totalDecoded += result.DecodedCount
-				totalExpected += result.K
+				var blocks []*[]byte
+				var numBlocks int
+				if hasSuperblocks {
+					blocks = superblock.SuperblocksToBlocks(result.Blocks, sbManifest.BlockCounts, sbManifest.TotalBlocks)
+					numBlocks = sbManifest.TotalBlocks
+				} else {
+					blocks = result.Blocks
+					numBlocks = k
+				}
+
+				decodedBlocks := 0
+				for _, b := range blocks {
+					if b != nil {
+						decodedBlocks++
+					}
+				}
+
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"  Epoch %d: decoded %d/%d blocks (units %d/%d, stop: %s, verify_failures: %d)\n",
+					eid, decodedBlocks, numBlocks, result.DecodedCount, result.K, result.StopReason, result.VerifyFailures)
+
+				totalDecoded += decodedBlocks
+				totalExpected += numBlocks
 
 				if outDir != "" {
-					for i, blk := range result.Blocks {
+					for i, blk := range blocks {
 						if blk == nil {
 							continue
 						}
@@ -122,7 +174,7 @@ func DecodeCmd() *cobra.Command {
 					}
 				}
 
-				globalBlockOffset += k
+				globalBlockOffset += numBlocks
 			}
 
 			fmt.Fprintf(cmd.OutOrStdout(), "Total decoded: %d/%d blocks\n", totalDecoded, totalExpected)
@@ -137,5 +189,6 @@ func DecodeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&blocksDir, "blocks-dir", "", "optional: path to Bitcoin blocks dir for header verification")
 	cmd.Flags().StringVar(&network, "network", "signet", "bitcoin network: mainnet, testnet, signet, regtest")
 	cmd.Flags().StringVar(&outDir, "out-dir", "", "optional: directory to write decoded block files")
+	cmd.Flags().IntVar(&superblockSize, "superblock-size", 4000000, "superblock target size in bytes (0 = auto-detect from sidecar; ignored if sidecar absent)")
 	return cmd
 }

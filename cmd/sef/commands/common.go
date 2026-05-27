@@ -2,6 +2,7 @@ package commands
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/btcsuite/btcd/wire"
 )
@@ -19,4 +20,9 @@ func parseNetwork(name string) (wire.BitcoinNet, error) {
 	default:
 		return 0, fmt.Errorf("unknown network %q: use mainnet, testnet, signet or regtest", name)
 	}
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

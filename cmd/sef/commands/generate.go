@@ -9,6 +9,7 @@ import (
 	"github.com/lucasdbr05/sef-golang/distribution"
 	"github.com/lucasdbr05/sef-golang/droplet"
 	"github.com/lucasdbr05/sef-golang/encode"
+	"github.com/lucasdbr05/sef-golang/superblock"
 	"github.com/spf13/cobra"
 )
 
@@ -20,6 +21,7 @@ func GenerateCmd() *cobra.Command {
 	var numDroplets uint64
 	var epochSize int
 	var network string
+	var superblockSize int
 
 	cmd := &cobra.Command{
 		Use:   "generate",
@@ -49,11 +51,17 @@ func GenerateCmd() *cobra.Command {
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Loaded %d blocks\n", totalBlocks)
 
+			if superblockSize > 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "Superblock mode: target size=%d bytes\n", superblockSize)
+			}
+
 			f, err := os.Create(outFile)
 			if err != nil {
 				return fmt.Errorf("creating output file: %w", err)
 			}
 			defer f.Close()
+
+			var epochManifests []superblock.EpochManifest
 
 			totalDroplets := uint64(0)
 			epochID := uint64(0)
@@ -65,13 +73,28 @@ func GenerateCmd() *cobra.Command {
 				epochBlocks := allBlocks[start:end]
 				k := len(epochBlocks)
 
-				dist := distribution.NewRobustSoliton(k, c, delta)
-				params := droplet.NewEpochParams(epochID, uint32(k), [32]byte{byte(epochID)})
-				enc := droplet.NewEncoder(&params, dist, epochBlocks)
+				sourceUnits := epochBlocks
+				if superblockSize > 0 {
+					supers, blockCounts := superblock.BlocksToSuperblocks(epochBlocks, superblockSize)
+					sourceUnits = supers
+					epochManifests = append(epochManifests, superblock.EpochManifest{
+						EpochID: epochID,
+						Manifest: superblock.Manifest{
+							TotalBlocks: k,
+							TotalSupers: len(supers),
+							BlockCounts: blockCounts,
+						},
+					})
+				}
+				unitK := len(sourceUnits)
+
+				dist := distribution.NewRobustSoliton(unitK, c, delta)
+				params := droplet.NewEpochParams(epochID, uint32(unitK), [32]byte{byte(epochID)})
+				enc := droplet.NewEncoder(&params, dist, sourceUnits)
 
 				n := numDroplets
 				if n == 0 {
-					n = uint64(3 * k)
+					n = uint64(3 * unitK)
 				}
 
 				for did := range n {
@@ -80,14 +103,24 @@ func GenerateCmd() *cobra.Command {
 						return fmt.Errorf("writing droplet epoch=%d did=%d: %w", epochID, did, err)
 					}
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "  Epoch %d: blocks [%d,%d) k=%d droplets=%d\n",
-					epochID, start, end, k, n)
+				fmt.Fprintf(cmd.OutOrStdout(), "  Epoch %d: blocks [%d,%d) k=%d units=%d droplets=%d\n",
+					epochID, start, end, k, unitK, n)
 				totalDroplets += n
 				epochID++
 			}
 
 			fmt.Fprintf(cmd.OutOrStdout(), "Wrote %d droplets across %d epochs to %s\n",
 				totalDroplets, epochID, outFile)
+
+			if superblockSize > 0 && len(epochManifests) > 0 {
+				manifestPath := outFile + ".superblock.bin"
+				manifestBytes := superblock.SerializeManifests(epochManifests)
+				if err := os.WriteFile(manifestPath, manifestBytes, 0644); err != nil {
+					return fmt.Errorf("writing superblock manifest: %w", err)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Wrote superblock manifest to %s\n", manifestPath)
+			}
+
 			return nil
 		},
 	}
@@ -100,5 +133,6 @@ func GenerateCmd() *cobra.Command {
 	cmd.Flags().Float64Var(&delta, "delta", 0.05, "Robust Soliton delta parameter")
 	cmd.Flags().Uint64Var(&numDroplets, "num-droplets", 300, "number of droplets per epoch")
 	cmd.Flags().IntVar(&epochSize, "epoch-size", 100, "number of blocks per epoch")
+	cmd.Flags().IntVar(&superblockSize, "superblock-size", 4000000, "target superblock size in bytes (0 = disable superblocks)")
 	return cmd
 }
